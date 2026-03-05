@@ -1,0 +1,8 @@
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+faster-whisper==1.0.3
+httpx==0.27.0
+requests
+bcrypt==4.1.2
+PyJWT==2.8.0
