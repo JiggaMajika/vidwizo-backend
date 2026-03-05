@@ -218,10 +218,12 @@ MODELS_CONFIG = {
         "whisper_local": {"name": "Whisper Local (Free)", "provider": None, "cost": "free", "quality": "good"},
         "openai_whisper": {"name": "OpenAI Whisper", "provider": "openai", "cost": "paid", "quality": "excellent"},
         "deepgram": {"name": "Deepgram Nova-2", "provider": "deepgram", "cost": "paid", "quality": "excellent"},
+        "gemini_pro": {"name": "Gemini Pro", "provider": "gemini", "cost": "paid", "quality": "excellent"},
     },
     "translate": {
         "basic": {"name": "Basic Dictionary (Free)", "provider": None, "cost": "free", "quality": "basic"},
         "openai_gpt4omini": {"name": "GPT-4o Mini", "provider": "openai", "cost": "paid", "quality": "excellent"},
+        "gemini_pro": {"name": "Gemini Pro", "provider": "gemini", "cost": "paid", "quality": "excellent"},
         "deepl": {"name": "DeepL Translate", "provider": "deepl", "cost": "paid", "quality": "excellent"},
         "google_translate": {"name": "Google Translate", "provider": "google_translate", "cost": "paid", "quality": "great"},
     },
@@ -229,6 +231,7 @@ MODELS_CONFIG = {
         "energy_analysis": {"name": "Audio Energy (Free)", "provider": None, "cost": "free", "quality": "good"},
         "whisper_enhanced": {"name": "Whisper-Enhanced (Free)", "provider": None, "cost": "free", "quality": "great"},
         "openai_analysis": {"name": "GPT-4o Mini Analysis", "provider": "openai", "cost": "paid", "quality": "excellent"},
+        "gemini_analysis": {"name": "Gemini Pro Analysis", "provider": "gemini", "cost": "paid", "quality": "excellent"},
     },
     "compress": {
         "ffmpeg": {"name": "FFmpeg (Free)", "provider": None, "cost": "free", "quality": "great"},
@@ -625,7 +628,7 @@ async def add_key(request: Request):
     api_key = body.get("apiKey", "").strip()
     label = body.get("label", "").strip()
 
-    valid_providers = ["openai", "deepgram", "deepl", "google_translate"]
+    valid_providers = ["openai", "deepgram", "deepl", "google_translate", "gemini"]
     if provider not in valid_providers:
         raise HTTPException(400, f"Invalid provider. Must be one of: {', '.join(valid_providers)}")
     if not api_key:
@@ -707,6 +710,13 @@ async def test_key(request: Request):
             elif provider == "google_translate":
                 resp = await client.get(
                     f"https://translation.googleapis.com/language/translate/v2/languages?key={api_key}"
+                )
+                valid = resp.status_code == 200
+                message = "Valid" if valid else f"Invalid key (HTTP {resp.status_code})"
+
+            elif provider == "gemini":
+                resp = await client.get(
+                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
                 )
                 valid = resp.status_code == 200
                 message = "Valid" if valid else f"Invalid key (HTTP {resp.status_code})"
@@ -1161,6 +1171,8 @@ async def generate_captions(
             api_key = get_user_api_key(user["id"], "openai")
         elif selected_model == "deepgram":
             api_key = get_user_api_key(user["id"], "deepgram")
+        elif selected_model == "gemini_pro":
+            api_key = get_user_api_key(user["id"], "gemini")
 
     if not api_key and selected_model in ("openai_whisper",):
         api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -1178,7 +1190,40 @@ async def generate_captions(
 
     segments = []
 
-    if selected_model == "deepgram" and api_key:
+    if selected_model == "gemini_pro" and api_key:
+        # Use Gemini Pro for transcription
+        import base64 as b64
+        with open(audio_path, "rb") as f:
+            audio_b64 = b64.b64encode(f.read()).decode("utf-8")
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+                json={
+                    "contents": [{
+                        "parts": [
+                            {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                            {"text": "Transcribe this audio with timestamps. Return ONLY a JSON array of objects with keys: id (number), start (seconds float), end (seconds float), text (string). No markdown, no explanation."}
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.1}
+                },
+                timeout=120,
+            )
+        if resp.status_code == 200:
+            content = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            if json_match:
+                try:
+                    segments = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    raise HTTPException(500, "Gemini returned invalid JSON for transcription")
+            else:
+                # Fallback: treat entire response as one segment
+                segments = [{"id": 1, "start": 0.0, "end": 30.0, "text": content.strip()}]
+        else:
+            raise HTTPException(500, f"Gemini API error: {resp.text[:300]}")
+
+    elif selected_model == "deepgram" and api_key:
         # Use Deepgram Nova-2
         with open(audio_path, "rb") as f:
             audio_data = f.read()
@@ -1284,6 +1329,8 @@ async def translate_captions(
     if user and not api_key:
         if selected_model == "openai_gpt4omini":
             api_key = get_user_api_key(user["id"], "openai")
+        elif selected_model == "gemini_pro":
+            api_key = get_user_api_key(user["id"], "gemini")
         elif selected_model == "deepl":
             api_key = get_user_api_key(user["id"], "deepl")
         elif selected_model == "google_translate":
@@ -1291,7 +1338,37 @@ async def translate_captions(
 
     translated = []
 
-    if selected_model == "openai_gpt4omini" and api_key:
+    if selected_model == "gemini_pro" and api_key:
+        # Use Gemini Pro for translation
+        all_text = "\n".join([f"[{i}] {seg['text']}" for i, seg in enumerate(segs)])
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+                json={
+                    "contents": [{
+                        "parts": [{"text": f"Translate the following numbered lines to {targetLang}. Keep the [number] prefix. Only output the translated lines, nothing else.\n\n{all_text}"}]
+                    }],
+                    "generationConfig": {"temperature": 0.3}
+                },
+                timeout=60,
+            )
+        if resp.status_code == 200:
+            content = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            lines = content.strip().split("\n")
+            translation_map = {}
+            for line in lines:
+                m = re.match(r"\[(\d+)\]\s*(.*)", line.strip())
+                if m:
+                    translation_map[int(m.group(1))] = m.group(2).strip()
+            for i, seg in enumerate(segs):
+                translated.append({
+                    **seg,
+                    "text": translation_map.get(i, seg["text"])
+                })
+        else:
+            raise HTTPException(500, f"Gemini translation error: {resp.text[:300]}")
+
+    elif selected_model == "openai_gpt4omini" and api_key:
         # Use GPT-4o Mini for translation
         all_text = "\n".join([f"[{i}] {seg['text']}" for i, seg in enumerate(segs)])
         async with httpx.AsyncClient() as client:
@@ -1765,7 +1842,7 @@ async def highlights(
         raise HTTPException(400, "No audio energy detected")
 
     # Boost energy scores for seconds that contain speech (Whisper-powered)
-    if selected_model in ("whisper_enhanced", "openai_analysis"):
+    if selected_model in ("whisper_enhanced", "openai_analysis", "gemini_analysis"):
         whisper = get_whisper_model()
         if whisper:
             try:
@@ -1785,6 +1862,48 @@ async def highlights(
                     speech_audio.unlink(missing_ok=True)
             except Exception:
                 pass  # Fall back to energy-only if Whisper fails
+
+    # If gemini_analysis model, use Gemini to pick best segments
+    if selected_model == "gemini_analysis" and user:
+        api_key = get_user_api_key(user["id"], "gemini")
+        if api_key:
+            try:
+                speech_audio = OUTPUT_DIR / f"{output_id}_gemini_speech.wav"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(input_path),
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                    str(speech_audio)
+                ], capture_output=True, timeout=120)
+                transcript_segs = []
+                if speech_audio.exists():
+                    whisper = get_whisper_model()
+                    if whisper:
+                        segs_iter, _ = whisper.transcribe(str(speech_audio), beam_size=3)
+                        for seg in segs_iter:
+                            transcript_segs.append({"start": round(seg.start, 1), "end": round(seg.end, 1), "text": seg.text.strip()})
+                    speech_audio.unlink(missing_ok=True)
+
+                if transcript_segs:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.post(
+                            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+                            json={
+                                "contents": [{
+                                    "parts": [{"text": f"You are a video editor. Given transcript segments with timestamps, pick the most interesting/engaging segments for a {targetDuration}s highlight reel. Return ONLY a JSON array of {{\"start\": number, \"end\": number}} objects.\n\n{json.dumps(transcript_segs)}"}]
+                                }],
+                                "generationConfig": {"temperature": 0.3}
+                            },
+                            timeout=30,
+                        )
+                    if resp.status_code == 200:
+                        content = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                        if json_match:
+                            gemini_clips = json.loads(json_match.group())
+                            if gemini_clips:
+                                scored_segments = [(c["start"], c["end"], 1.0) for c in gemini_clips]
+            except Exception:
+                pass  # Fall back to energy analysis
 
     # If openai_analysis model, use GPT to pick best segments
     if selected_model == "openai_analysis" and user:
