@@ -207,7 +207,7 @@ def user_to_profile(user: dict) -> dict:
 # ===========================================================================
 
 PLANS = {
-    "free": {"name": "Free", "price": 0, "currency": "ZAR", "videos_per_month": 3, "features": ["compress", "trim", "silence_removal"]},
+    "free": {"name": "Free", "price": 0, "currency": "ZAR", "videos_per_month": 3, "features": ["compress", "trim", "snippets", "silence_removal"]},
     "starter": {"name": "Starter", "price": 9900, "currency": "ZAR", "videos_per_month": 15, "features": "all", "models": ["free_only"]},
     "pro": {"name": "Pro", "price": 29900, "currency": "ZAR", "videos_per_month": 50, "features": "all", "models": "all"},
     "business": {"name": "Business", "price": 59900, "currency": "ZAR", "videos_per_month": -1, "features": "all", "models": "all", "priority": True},
@@ -238,6 +238,9 @@ MODELS_CONFIG = {
     },
     "trim": {
         "ffmpeg": {"name": "FFmpeg (Free)", "provider": None, "cost": "free", "quality": "great"},
+    },
+    "snippets": {
+        "ffmpeg": {"name": "FFmpeg (Free)", "provider": None, "cost": "free", "quality": "good"},
     },
     "silence_removal": {
         "ffmpeg": {"name": "FFmpeg Detect (Free)", "provider": None, "cost": "free", "quality": "great"},
@@ -1089,6 +1092,105 @@ async def trim_video(
 
     size = output_path.stat().st_size
     return {"outputId": f"{output_id}_trimmed", "size": size, "filename": f"trimmed_{fileId[:8]}.mp4"}
+
+
+@app.post("/api/cut-snippets")
+async def cut_snippets(
+    request: Request,
+    fileId: str = Form(...),
+    ext: str = Form(".mp4"),
+    snippets: str = Form(...),  # JSON string: [{"start": "00:00:05", "end": "00:00:15"}, ...]
+):
+    user = check_usage_limits(request, "snippets")
+    input_path = UPLOAD_DIR / f"{fileId}{ext}"
+    if not input_path.exists():
+        raise HTTPException(404, "File not found")
+
+    try:
+        snippet_list = json.loads(snippets)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid snippets JSON")
+
+    if not isinstance(snippet_list, list) or len(snippet_list) < 1:
+        raise HTTPException(400, "At least 1 snippet is required")
+    if len(snippet_list) > 20:
+        raise HTTPException(400, "Maximum 20 snippets allowed")
+
+    output_id = str(uuid.uuid4())
+    temp_segments = []
+
+    try:
+        # Extract each snippet
+        for i, snip in enumerate(snippet_list):
+            start = snip.get("start", "00:00:00")
+            end = snip.get("end", "00:00:10")
+            seg_path = OUTPUT_DIR / f"{output_id}_seg{i}.mp4"
+            temp_segments.append(seg_path)
+
+            cmd = [
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-ss", start, "-to", end,
+                "-c", "copy", "-avoid_negative_ts", "1",
+                str(seg_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0 or not seg_path.exists():
+                raise HTTPException(500, f"Failed to extract snippet {i+1}: {result.stderr[:300]}")
+
+        output_path = OUTPUT_DIR / f"{output_id}_snippets.mp4"
+
+        if len(temp_segments) == 1:
+            # Single snippet — just rename
+            shutil.move(str(temp_segments[0]), str(output_path))
+        else:
+            # Multiple snippets — concat
+            concat_file = OUTPUT_DIR / f"{output_id}_concat.txt"
+            with open(concat_file, "w") as f:
+                for seg in temp_segments:
+                    f.write(f"file '{seg}'\n")
+
+            cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(concat_file), "-c", "copy",
+                str(output_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+            if result.returncode != 0 or not output_path.exists():
+                # Retry with re-encode
+                cmd = [
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", str(concat_file), "-c:v", "libx264", "-c:a", "aac",
+                    str(output_path)
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+            # Clean up concat list
+            concat_file.unlink(missing_ok=True)
+
+        if not output_path.exists():
+            raise HTTPException(500, f"Snippet merge failed: {result.stderr[:500]}")
+
+    finally:
+        # Clean up temp segments
+        for seg in temp_segments:
+            if seg.exists():
+                seg.unlink(missing_ok=True)
+
+    # Track usage
+    if user:
+        log_usage(user["id"], "snippets", "ffmpeg")
+    else:
+        ip = request.client.host if request.client else "unknown"
+        record_anon_usage(ip)
+
+    size = output_path.stat().st_size
+    return {
+        "outputId": f"{output_id}_snippets",
+        "size": size,
+        "filename": f"snippets_{fileId[:8]}.mp4",
+        "snippetCount": len(snippet_list),
+    }
 
 
 @app.post("/api/compress")
